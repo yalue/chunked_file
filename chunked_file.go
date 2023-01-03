@@ -4,8 +4,10 @@
 package chunked_file
 
 import (
+	"fmt"
 	"io"
 	"os"
+	"sort"
 )
 
 // Satisfies the WriteSeeker interface, in order to allow writing to multiple
@@ -36,13 +38,12 @@ func (w *ChunkedWriter) Close() error {
 	for _, f := range w.files {
 		e = f.Close()
 		if e != nil {
-			msg += ", " + e.Error
+			msg += ", " + e.Error()
 		}
 	}
-	e.files = nil
-	e.fileNames = nil
-	e.baseFilename = ""
-	e.chunkSize = 0
+	w.files = nil
+	w.baseFilename = ""
+	w.chunkSize = 0
 	if e != nil {
 		// TODO: Wrap all of the errors instead
 		return fmt.Errorf("%s", msg)
@@ -54,7 +55,7 @@ func (w *ChunkedWriter) getFilename(chunkIndex int64) string {
 	if chunkIndex < 0 {
 		panic("Invalid chunk index")
 	}
-	return fmt.Sprintf("%s.%d.part", w.baseFilename, chunkIndex)
+	return fmt.Sprintf("%s.part.%d", w.baseFilename, chunkIndex)
 }
 
 // Writes chunks of zeros to the given sink, returning an error if one occurs.
@@ -84,7 +85,7 @@ func writeZerosToDst(dst io.Writer, size int64) error {
 
 // Creates a new file to hold the given chunk index. Does not append it to the
 // list or modify/access the existing file list.
-func (w *ChunkedWriter) createNewFile(index int) (*os.File, error) {
+func (w *ChunkedWriter) createNewFile(index int64) (*os.File, error) {
 	newFilename := w.getFilename(index)
 	fileFlags := os.O_RDWR | os.O_CREATE
 	if !w.OverwriteFiles {
@@ -105,21 +106,23 @@ func (w *ChunkedWriter) zeroFillFileAtOffset(offset, maxSize int64) (int64,
 	fileIndex := offset / chunkSize
 	// Note: we only ever use this function to sequentially append chunks, so
 	// this counts as an internal error.
-	if fileIndex > len(w.files) {
+	if fileIndex > int64(len(w.files)) {
 		return 0, fmt.Errorf("Internal error: offset %d writes to file %d, "+
 			"but only %d files have been created so far", offset, fileIndex,
 			len(w.files))
 	}
 	// Create a new file if we're at the end of the list.
-	if fileIndex == len(w.files) {
+	if fileIndex == int64(len(w.files)) {
 		if offsetInFile != 0 {
 			return 0, fmt.Errorf("Internal error: Not zero-filling at the " +
 				"start of a new file")
 		}
-		w.files[fileIndex], e = w.createNewFile(fileIndex)
+		f, e := w.createNewFile(fileIndex)
 		if e != nil {
-			return 0, fmt.Errorf("Error opening %s: %w", newFilename, e)
+			return 0, fmt.Errorf("Error opening %s: %w",
+				w.getFilename(fileIndex), e)
 		}
+		w.files = append(w.files, f)
 	}
 	f := w.files[fileIndex]
 	bytesRemainingInFile := chunkSize - offsetInFile
@@ -143,17 +146,19 @@ func (w *ChunkedWriter) zeroFillFileAtOffset(offset, maxSize int64) (int64,
 // If w's current offset is past the end of the available files, append 0s (and
 // create new files if needed) until we're at the correct offset.
 func (w *ChunkedWriter) fillEmpty() error {
+	fmt.Printf("In fillEmpty, current offset = %d, max offset = %d\n",
+		w.currentOffset, w.maxOffset)
 	if w.currentOffset < w.maxOffset {
 		return nil
 	}
 	offset := w.maxOffset
-	maxSize := w.maxOffset - w.currentOffset
-	for maxSize > 0 {
-		bytesWritten, e := w.zeroFillFileAtOffset(offset, maxSize)
+	sizeToFill := w.currentOffset - w.maxOffset
+	for sizeToFill > 0 {
+		bytesWritten, e := w.zeroFillFileAtOffset(offset, sizeToFill)
 		if e != nil {
 			return fmt.Errorf("Failed filling empty data: %w", e)
 		}
-		maxSize -= bytesWritten
+		sizeToFill -= bytesWritten
 		offset += bytesWritten
 	}
 	w.maxOffset = w.currentOffset
@@ -175,7 +180,6 @@ func (w *ChunkedWriter) Seek(offset int64, whence int) (int64, error) {
 	if newOffset < 0 {
 		return 0, fmt.Errorf("Invalid new offset: %d", newOffset)
 	}
-	oldOffset := w.currentOffset
 	w.currentOffset = newOffset
 	e := w.fillEmpty()
 	if e != nil {
@@ -211,7 +215,7 @@ func (w *ChunkedWriter) writeNextChunk(offset int64, data []byte) (int64,
 			return 0, fmt.Errorf("Internal error: attempting to write after " +
 				"the start of a chunk that hasn't been created yet")
 		}
-		f, e := w.createNewFile(len(w.files))
+		f, e := w.createNewFile(int64(len(w.files)))
 		if e != nil {
 			return 0, fmt.Errorf("Error creating file for chunk %d: %w",
 				len(w.files), e)
@@ -234,8 +238,9 @@ func (w *ChunkedWriter) writeNextChunk(offset int64, data []byte) (int64,
 	}
 	bytesWritten, e := f.Write(data[0:toWrite])
 	if e != nil {
-		return bytesWritten, fmt.Errorf("Failed writing %d bytes to offset "+
-			"%d in chunk %d: %w", toWrite, offsetInFile, fileIndex, e)
+		tmp := int64(bytesWritten)
+		return tmp, fmt.Errorf("Failed writing %d bytes to offset %d in "+
+			"chunk %d: %w", toWrite, offsetInFile, fileIndex, e)
 	}
 	return toWrite, nil
 }
@@ -244,13 +249,15 @@ func (w *ChunkedWriter) Write(data []byte) (int, error) {
 	// We'll simply write chunks of data in a loop until we have no more left.
 	// We'll only modify w's state minimally until writes are finished.
 	offset := w.currentOffset
-	totalWritten := 0
+	totalWritten := int64(0)
 	for len(data) > 0 {
 		bytesWritten, e := w.writeNextChunk(offset, data)
 		if e != nil {
-			// NOTE: Should I also update currentOffset and maxOffset here,
-			// if a write has failed?
-			return totalWritten, e
+			w.currentOffset = offset
+			if offset > w.maxOffset {
+				w.maxOffset = offset
+			}
+			return int(totalWritten), e
 		}
 		totalWritten += bytesWritten
 		offset += bytesWritten
@@ -267,85 +274,141 @@ func (w *ChunkedWriter) Write(data []byte) (int, error) {
 }
 
 // Creates a new ChunkedWriter, which will be backed by files named
-// <baseFilename>.<chunkNumber>.part. Each chunk will be chunkSize bytes,
+// <baseFilename>.part.<chunkNumber>. Each chunk will be chunkSize bytes,
 // apart from the last chunk, which may be smaller. Note that no files will be
 // created or written until the first Read() or Seek() operation.
-func NewChunkedWriter(chunkSize uint64, baseFilename string) *ChunkedWriter {
+func NewChunkedWriter(chunkSize uint64, baseFilename string) (*ChunkedWriter,
+	error) {
 	return &ChunkedWriter{
-		OverwiteFiles: true,
-		chunkSize:     chunkSize,
-		baseFilename:  baseFilename,
-		files:         make([]*os.File, 0, 32),
-		currentOffset: 0,
-		maxOffset:     0,
-	}
+		OverwriteFiles: true,
+		chunkSize:      chunkSize,
+		baseFilename:   baseFilename,
+		files:          make([]*os.File, 0, 32),
+		currentOffset:  0,
+		maxOffset:      0,
+	}, nil
 }
 
 // We delegate management of file handles to this struct, so the actual
 // ChunkedReader is decoupled from how we cache (or don't cache) open files.
 type fileChunkSource struct {
-	// A list of all of the filenames for the file chunks.
-	filePaths []string
+	// The open handles for each file.
+	files []*os.File
 	// The size of each file chunk
 	fileSizes []int64
-	// The total size of all chunks. Equal to the sum of fileSizes.
-	totalSize int64
-	// The last file that was opened; will be closed internally when a new
-	// chunk is opened.
-	lastOpenedFile *os.File
+	// The cumulative size of each chunk, used to binary-search for the chunk
+	// containing a given offset. Index i of this slice contains the offset at
+	// which file i *starts*.
+	cumulativeSizes []int64
+	// The index of lastOpenedFile.
+	lastOpenedFileIndex int64
 }
 
 // Returns the total size of all files provided by this source.
-func (s *fileChunkSource) Size() (int64, error) {
-	return s.totalSize, nil
+func (s *fileChunkSource) Size() int64 {
+	if len(s.files) == 0 {
+		return 0
+	}
+	n := len(s.files)
+	return s.cumulativeSizes[n-1] + s.fileSizes[n-1]
 }
 
 // Closes any underlying file handles. Must be called when the file chunks are
 // no longer needed.
 func (s *fileChunkSource) Close() error {
-	if s.lastOpenedFile == nil {
-		return nil
+	var e, tmp error
+	for i := range s.files {
+		tmp = s.files[i].Close()
+		// We'll keep track only of the first error we encounter, but continue
+		// trying to close everything.
+		if (tmp != nil) && (e == nil) {
+			e = tmp
+		}
 	}
-	return s.lastOpenedFile.Close()
+	return e
 }
 
 // Returns the file containing the given offset, followed by the offset within
 // the file and the file's total size.
 func (s *fileChunkSource) GetFileForOffset(offset int64) (*os.File, int64,
 	int64, error) {
-	return nil, 0, 0, fmt.Errorf("Not yet implemented")
+	if len(s.files) == 0 {
+		return nil, 0, 0, fmt.Errorf("No files are available")
+	}
+	// Quick optimization under the assumption that the first chunk is more
+	// likely to be accessed frequently.
+	if offset < s.fileSizes[0] {
+		return s.files[0], offset, s.fileSizes[0], nil
+	}
+	// Second basic heuristic: check whether we're still in the same file as
+	// last time.
+	if s.lastOpenedFileIndex >= 0 {
+		lastOpenedStart := s.cumulativeSizes[s.lastOpenedFileIndex]
+		lastOpenedSize := s.fileSizes[s.lastOpenedFileIndex]
+		lastOpenedEnd := lastOpenedStart + lastOpenedSize
+		if (offset >= lastOpenedStart) && (offset < lastOpenedEnd) {
+			return s.files[s.lastOpenedFileIndex], offset - lastOpenedStart,
+				lastOpenedSize, nil
+		}
+	}
+	// Use go's standard sort to find the index containing the given offset.
+	// The binary sort is fine, because the cumulative sizes are inherently
+	// sorted.
+	index, _ := sort.Find(len(s.cumulativeSizes), func(i int) int {
+		rangeStart := s.cumulativeSizes[i]
+		if rangeStart < offset {
+			return 1
+		}
+		if rangeStart == offset {
+			return 0
+		}
+		return -1
+	})
+	if index >= len(s.cumulativeSizes) {
+		return nil, 0, 0, fmt.Errorf("Internal error: GetFileForOffset "+
+			"called with an offset of %d, while the total size is %d",
+			offset, s.Size())
+	}
+	offsetInFile := offset - s.cumulativeSizes[index]
+	fileSize := s.fileSizes[index]
+	s.lastOpenedFileIndex = int64(index)
+	return s.files[index], offsetInFile, fileSize, nil
 }
 
 // Returns a new file chunk source. The returned fileChunkSource must be
 // Close()'d by the caller when no longer needed.
 func newFileChunkSource(filePaths ...string) (*fileChunkSource, error) {
+	if len(filePaths) == 0 {
+		return nil, fmt.Errorf("No file paths were provided")
+	}
+	files := make([]*os.File, len(filePaths))
 	fileSizes := make([]int64, len(filePaths))
+	cumulativeSizes := make([]int64, len(filePaths))
+	totalSize := int64(0)
+	var e error
 	for i, filePath := range filePaths {
-		f, e := os.Open(filePath)
+		files[i], e = os.Open(filePath)
 		if e != nil {
 			return nil, fmt.Errorf("Failed opening %s: %w", filePath, e)
 		}
-		info, e := f.Stat()
-		f.Close()
+		info, e := files[i].Stat()
 		if e != nil {
 			return nil, fmt.Errorf("Failed getting info for %s: %w", filePath,
 				e)
 		}
+		// Note that the cumulative size at a given index is the size *prior*
+		// to that index.
+		cumulativeSizes[i] = totalSize
 		fileSizes[i] = info.Size()
-	}
-	totalSize := int64(0)
-	for _, size := range fileSizes {
-		totalSize += size
+		totalSize += fileSizes[i]
 	}
 	return &fileChunkSource{
-		filePaths:      filePaths,
-		fileSizes:      fileSizes,
-		totalSize:      totalSize,
-		lastOpenedFile: nil,
+		files:               files,
+		fileSizes:           fileSizes,
+		cumulativeSizes:     cumulativeSizes,
+		lastOpenedFileIndex: -1,
 	}, nil
 }
-
-// TODO (next): Finish changing fileChunkSource to a struct.
 
 // Satisfies the ReadSeeker interface, in order to allow reading from multiple
 // files as if they're a single contiguous file. Create instances of this using
@@ -359,9 +422,98 @@ type ChunkedReader struct {
 	size int64
 }
 
-// TODO (next, 2): Implement ChunkedReader's Read function:
-//  - In a loop, call a readNextChunk function, which will get the chunk source
-//    for the current offset and read until the end of it, or until the
-//    remaining needed data has been provided.
+// Returns a new ChunkedReader instance, requiring the paths to each subsequent
+// chunk, starting with chunk 0. Note that the filePaths provided to this
+// function do not need to adhere to any naming convention, or necessarily be
+// the same size.
+func NewChunkedReader(filePaths ...string) (*ChunkedReader, error) {
+	fileSource, e := newFileChunkSource(filePaths...)
+	if e != nil {
+		return nil, fmt.Errorf("Error accessing chunk files: %w", e)
+	}
+	return &ChunkedReader{
+		files:         fileSource,
+		currentOffset: 0,
+		size:          fileSource.Size(),
+	}, nil
+}
 
-// TODO: Write tests for ChunkedReader and ChunkedWriter.
+func (r *ChunkedReader) Close() error {
+	return r.files.Close()
+}
+
+func (r *ChunkedReader) Seek(offset int64, whence int) (int64, error) {
+	var newOffset int64
+	switch whence {
+	case io.SeekStart:
+		newOffset = offset
+	case io.SeekCurrent:
+		newOffset = r.currentOffset + offset
+	case io.SeekEnd:
+		newOffset = r.size + offset
+	default:
+		return 0, fmt.Errorf("Invalid Seek \"whence\": %d", whence)
+	}
+	if newOffset < 0 {
+		return 0, fmt.Errorf("Invalid new offset: %d", newOffset)
+	}
+	if newOffset > r.size {
+		r.currentOffset = r.size
+		return r.size, fmt.Errorf("New offset (%d) larger than file size "+
+			"(%d): %w", newOffset, r.size, io.EOF)
+	}
+	r.currentOffset = newOffset
+	return newOffset, nil
+}
+
+// Reads as much as possible from a single chunk into dst. Returns the number
+// of bytes read, or an error if any occurs. Takes the current offset, rather
+// than using r.currentOffset to enable changing internal state on an error.
+func (r *ChunkedReader) readSingleChunk(dst []byte,
+	currentOffset int64) (int64, error) {
+	f, offsetInFile, fileSize, e := r.files.GetFileForOffset(currentOffset)
+	if e != nil {
+		return 0, fmt.Errorf("Error getting chunk for reading offset %d: %w",
+			currentOffset, e)
+	}
+	_, e = f.Seek(offsetInFile, io.SeekStart)
+	if e != nil {
+		return 0, fmt.Errorf("Error seeking to offset %d (%d in file) "+
+			"when reading: %w", currentOffset, offsetInFile, e)
+	}
+	remainingInFile := fileSize - offsetInFile
+	bytesToRead := int64(len(dst))
+	if bytesToRead > remainingInFile {
+		bytesToRead = remainingInFile
+	}
+	_, e = f.Read(dst[:bytesToRead])
+	if e != nil {
+		return 0, fmt.Errorf("Error reading %d bytes at offset %d (%d in "+
+			"file): %w", bytesToRead, currentOffset, offsetInFile, e)
+	}
+	return bytesToRead, nil
+}
+
+func (r *ChunkedReader) Read(dst []byte) (int, error) {
+	if r.currentOffset >= r.size {
+		return 0, io.EOF
+	}
+	currentOffset := r.currentOffset
+	totalRead := int64(0)
+	for len(dst) > 0 {
+		if currentOffset >= r.size {
+			r.currentOffset = currentOffset
+			return int(totalRead), io.EOF
+		}
+		bytesRead, e := r.readSingleChunk(dst, currentOffset)
+		totalRead += bytesRead
+		currentOffset += bytesRead
+		if e != nil {
+			r.currentOffset = currentOffset
+			return int(totalRead), fmt.Errorf("Failed reading chunk: %w", e)
+		}
+		dst = dst[bytesRead:]
+	}
+	r.currentOffset = currentOffset
+	return int(totalRead), nil
+}
