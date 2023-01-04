@@ -146,8 +146,6 @@ func (w *ChunkedWriter) zeroFillFileAtOffset(offset, maxSize int64) (int64,
 // If w's current offset is past the end of the available files, append 0s (and
 // create new files if needed) until we're at the correct offset.
 func (w *ChunkedWriter) fillEmpty() error {
-	fmt.Printf("In fillEmpty, current offset = %d, max offset = %d\n",
-		w.currentOffset, w.maxOffset)
 	if w.currentOffset < w.maxOffset {
 		return nil
 	}
