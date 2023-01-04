@@ -362,6 +362,9 @@ func (s *fileChunkSource) GetFileForOffset(offset int64) (*os.File, int64,
 		}
 		return -1
 	})
+	// Note that the above loop returns the index of the first offset that's
+	// *larger than* the offset; we need one less than that.
+	index--
 	if index >= len(s.cumulativeSizes) {
 		return nil, 0, 0, fmt.Errorf("Internal error: GetFileForOffset "+
 			"called with an offset of %d, while the total size is %d",
